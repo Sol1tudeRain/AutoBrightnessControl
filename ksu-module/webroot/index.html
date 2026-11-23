@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <meta name="color-scheme" content="dark light" />
+  <title>Brightness Link</title>
+  <style>
+    :root { color-scheme: dark; --bg:#101418; --card:#1b2229; --muted:#a7b4c3; --fg:#f3f6f9; --line:#34424c; --accent:#80bfff; }
+    * { box-sizing: border-box; }
+    body { background:var(--bg); color:var(--fg); font:15px system-ui,Roboto,sans-serif; margin:0; padding:28px 17px 50px; }
+    main { max-width:600px; margin:auto; }
+    h1 { font-size:25px; margin:0 0 7px; } p { color:var(--muted); line-height:1.6; font-size:13px; }
+    section { background:var(--card); border:1px solid var(--line); border-radius:18px; padding:19px; margin:18px 0; }
+    .flex { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+    h2 { font-size:17px; margin:0; } .value { color:var(--accent); font-size:26px; font-weight:650; font-variant-numeric:tabular-nums; }
+    input[type=range] { display:block; width:100%; height:36px; accent-color:var(--accent); }
+    input[type=checkbox] { accent-color:var(--accent); height:22px; width:22px; }
+    input:disabled { opacity:0.4; } #status { min-height:42px; font-size:13px; }
+    button { border:1px solid var(--line); color:var(--fg); background:#273642; border-radius:11px; padding:11px 15px; }
+    .warn { border-left:3px solid #ffba69; padding-left:11px; }
+  </style>
+</head>
+<body><main>
+  <h1>Brightness Link</h1>
+  <p>自动亮度上限 + AOD 跟随比例。调节值保存到系统设置，LSPosed 钩子读取后在下一次亮度计算时应用。</p>
+  <section>
+    <div class="flex"><h2>自动亮度上限</h2><input id="autoEnabled" type="checkbox" aria-label="启用自动亮度上限"/></div>
+    <p>仅截断系统自动亮度输出，手动亮度不受影响。百分比使用 AOSP 亮度滑块的 Gamma 映射近似换算。</p>
+    <div class="flex"><span>上限</span><span class="value" id="autoText">70%</span></div>
+    <input id="autoCap" type="range" min="10" max="100" step="1" value="70"/>
+    <div class="flex"><small>10%</small><small>100%</small></div>
+  </section>
+  <section>
+    <div class="flex"><h2>AOD 亮度比例</h2><input id="aodEnabled" type="checkbox" aria-label="启用 AOD 比例" /></div>
+    <p>以系统记录的正常屏幕亮度为基准，乘以此比例。100% 为相同归一化亮度目标；最终仍可能受 AOD 遮罩、低亮度保护和驱动限制。</p>
+    <div class="flex"><span>比例</span><span class="value" id="aodText">10%</span></div>
+    <input id="aodRatio" type="range" min="1" max="100" step="1" value="10"/>
+    <div class="flex"><small>1%</small><small>100%</small></div>
+    <p class="warn">OLED AOD 长时间高亮可能增加功耗和烧屏风险。建议先使用 5–15%，不要直接设 100%。</p>
+  </section>
+  <div class="flex"><button id="reload">重新读取设置</button><button id="disableAll">关闭两个限制</button></div>
+  <p id="status" role="status"></p>
+  <p>若滑块调整后没有立即变化，开关屏幕或等待下一次自动亮度更新。首次启用前，请先在 LSPosed 中启用 APK，并勾选 System Framework（system / android）与 System UI。</p>
+</main>
+<script>
+'use strict';
+const K = {autoEnabled:'brightnesslink_auto_enabled', autoCap:'brightnesslink_auto_cap', aodEnabled:'brightnesslink_aod_enabled', aodRatio:'brightnesslink_aod_ratio'};
+const ids = Object.keys(K), d = id => document.getElementById(id);
+const defaults = {autoEnabled:0, autoCap:70, aodEnabled:0, aodRatio:10};
+let suppress = false, counter = 0;
+function rootExec(command) {
+  return new Promise((resolve,reject) => {
+    if (!window.ksu || typeof window.ksu.exec !== 'function') return reject(Error('请从 KernelSU 管理器打开 WebUI'));
+    const name = '__bl_cb_' + (++counter);
+    window[name] = function(errno, stdout, stderr) { delete window[name];
+      errno === 0 ? resolve((stdout || '').trim()) : reject(Error(stderr || 'shell exit '+errno)); };
+    try { window.ksu.exec(command, '{}', name); } catch(e) { delete window[name]; reject(e); }
+  });
+}
+function updateLabels() { d('autoText').textContent=d('autoCap').value+'%'; d('aodText').textContent=d('aodRatio').value+'%'; }
+function setStatus(s, err=false) { d('status').textContent=s; d('status').style.color=err?'#ffae8c':'var(--muted)'; }
+async function reload() {
+  setStatus('读取中…'); suppress=true;
+  try {
+    const pairs = await Promise.all(ids.map(k=>rootExec('settings get global '+K[k])));
+    ids.forEach((id,i) => {
+      const v = Number.parseInt(pairs[i],10);
+      const n = Number.isInteger(v) ? v : defaults[id];
+      if (id.endsWith('Enabled')) d(id).checked = n===1;
+      else d(id).value = Math.max(Number(d(id).min), Math.min(Number(d(id).max),n));
+    });
+    updateLabels(); setStatus('已读取系统设置；功能状态取决于 LSPosed 模块是否已运行。');
+  } catch(e) { setStatus('读取失败：'+e.message,true); }
+  suppress=false;
+}
+async function saveOne(id) {
+  if (suppress) return;
+  const value = id.endsWith('Enabled') ? (d(id).checked?1:0) : Number.parseInt(d(id).value,10);
+  if (!Number.isInteger(value)) return;
+  updateLabels(); setStatus('正在保存…');
+  try {
+    await rootExec('settings put global '+K[id]+' '+value);
+    setStatus('已保存：'+(id.startsWith('auto')?'自动亮度':'AOD')+'。下一次亮度计算时生效。');
+  } catch(e) { setStatus('保存失败：'+e.message,true); }
+}
+for (const id of ids) {
+  const el=d(id);
+  if (el.type==='range') el.addEventListener('input',updateLabels);
+  el.addEventListener('change',()=>saveOne(id));
+}
+d('reload').addEventListener('click',reload);
+d('disableAll').addEventListener('click',async()=>{
+  try {
+    await rootExec('settings put global '+K.autoEnabled+' 0; settings put global '+K.aodEnabled+' 0');
+    d('autoEnabled').checked=false; d('aodEnabled').checked=false; setStatus('两个功能已关闭。');
+  } catch(e) { setStatus('关闭失败：'+e.message,true); }
+});
+reload();
+</script>
+</body></html>

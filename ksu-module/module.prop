@@ -1,0 +1,7 @@
+id=brightnesslink_panel
+name=Brightness Link - Auto Cap & AOD Ratio Panel
+version=0.1.0-beta
+versionCode=1
+author=OpenAI / experimental source
+minApi=29
+description=Two live brightness sliders. Requires separately installed and enabled LSPosed APK. No boot scripts; safe defaults OFF.
