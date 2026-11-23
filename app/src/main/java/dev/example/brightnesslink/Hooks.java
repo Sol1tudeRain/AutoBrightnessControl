@@ -4,6 +4,7 @@ import android.content.Context;
 import android.provider.Settings;
 import android.hardware.display.DisplayManager;
 import android.view.Display;
+import java.lang.reflect.Method;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -24,8 +25,10 @@ public final class Hooks implements IXposedHookLoadPackage {
     private static final String TAG = "BrightnessLink: ";
 
     @Override public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
-        if (("android".equals(lpparam.packageName) || "system".equals(lpparam.packageName))
-                && "system_server".equals(lpparam.processName)) {
+        // LSPosed commonly exposes system_server as package/process "android".
+        if ("android".equals(lpparam.packageName)
+                && ("android".equals(lpparam.processName)
+                    || "system_server".equals(lpparam.processName))) {
             hookAutomaticBrightness(lpparam.classLoader);
         }
         if ("com.android.systemui".equals(lpparam.packageName)
@@ -85,6 +88,30 @@ public final class Hooks implements IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * Read the regular display brightness using SystemUI's own helper when present.
+     * This avoids linking against the @hide DisplayManager.getBrightness(int) API,
+     * which is absent from the public SDK android.jar.
+     */
+    private static float normalDisplayBrightness(Object dozeController, Context ctx) {
+        try {
+            Method m = dozeController.getClass().getDeclaredMethod("getScreenBrightnessFloat");
+            m.setAccessible(true);
+            Object value = m.invoke(dozeController);
+            if (value instanceof Number) return ((Number) value).floatValue();
+        } catch (Throwable ignored) { }
+        try {
+            DisplayManager dm = null;
+            try { dm = (DisplayManager) XposedHelpers.getObjectField(dozeController, "mDisplayManager"); }
+            catch (Throwable ignored) { }
+            if (dm == null && ctx != null) dm = (DisplayManager) ctx.getSystemService(Context.DISPLAY_SERVICE);
+            if (dm == null) return -1f;
+            Method get = dm.getClass().getMethod("getBrightness", int.class);
+            Object value = get.invoke(dm, Display.DEFAULT_DISPLAY);
+            return value instanceof Number ? ((Number) value).floatValue() : -1f;
+        } catch (Throwable ignored) { return -1f; }
+    }
+
     private static void hookDozeBrightness(ClassLoader loader) {
         try {
             Class<?> cls = XposedHelpers.findClass("com.android.systemui.doze.DozeScreenBrightness", loader);
@@ -96,11 +123,7 @@ public final class Hooks implements IXposedHookLoadPackage {
                         if (readInt(ctx, AOD_ENABLED, 0) != 1) return;
                         int pct = Math.max(1, Math.min(100, readInt(ctx, AOD_RATIO, 10)));
                         float ratio = pct / 100f;
-                        DisplayManager dm = null;
-                        try { dm = (DisplayManager) XposedHelpers.getObjectField(param.thisObject, "mDisplayManager"); }
-                        catch (Throwable ignored) { }
-                        if (dm == null && ctx != null) dm = (DisplayManager) ctx.getSystemService(Context.DISPLAY_SERVICE);
-                        float normal = dm == null ? -1f : dm.getBrightness(Display.DEFAULT_DISPLAY);
+                        float normal = normalDisplayBrightness(param.thisObject, ctx);
                         if (!Float.isFinite(normal) || normal <= 0f || normal > 1.0f) return;
                         // Mirrors AOSP's own source of current manual/auto brightness.
                         float target = constrain(normal * ratio, 0.005f, 1.0f);
