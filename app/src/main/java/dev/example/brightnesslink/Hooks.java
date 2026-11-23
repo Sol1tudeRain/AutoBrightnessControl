@@ -94,7 +94,7 @@ public final class Hooks implements IXposedHookLoadPackage {
     // Automatic brightness logic above remains unchanged.
     private static int sAodAppliedLogs = 0;
     private static int sAodSkipLogs = 0;
-    private static final float MIN_WORKING_DOZE = 0.01f;
+    private static final float MIN_WORKING_DOZE = 0.005f;
 
     private static boolean validNormal(float v) {
         return Float.isFinite(v) && v > 0f && v <= 1f;
