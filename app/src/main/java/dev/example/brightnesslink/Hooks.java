@@ -5,6 +5,7 @@ import android.provider.Settings;
 import android.hardware.display.DisplayManager;
 import android.view.Display;
 import java.lang.reflect.Method;
+import java.lang.reflect.Field;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -33,6 +34,7 @@ public final class Hooks implements IXposedHookLoadPackage {
         }
         if ("com.android.systemui".equals(lpparam.packageName)
                 && "com.android.systemui".equals(lpparam.processName)) {
+            XposedBridge.log(TAG + "SystemUI loaded; initializing AOD hooks");
             hookDozeBrightness(lpparam.classLoader);
         }
     }
@@ -88,64 +90,182 @@ public final class Hooks implements IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * Read the regular display brightness using SystemUI's own helper when present.
-     * This avoids linking against the @hide DisplayManager.getBrightness(int) API,
-     * which is absent from the public SDK android.jar.
-     */
-    private static float normalDisplayBrightness(Object dozeController, Context ctx) {
+    // ---------------- AOD ONLY (does not change the automatic brightness hook) ----------------
+    // Keep the last NORMAL screen brightness, not the Doze brightness. The latter may be 0.
+    private static volatile float sLastNormalBrightness = -1f;
+    private static int sAodLogCount = 0;
+    private static final float MIN_WORKING_DOZE = 0.01f; // confirmed with the user's old RRO
+
+    private static Context contextOf(Object object) {
+        if (object instanceof Context) return (Context) object;
+        return fieldContext(object);
+    }
+
+    private static boolean validNormal(float v) {
+        return Float.isFinite(v) && v > 0f && v <= 1f;
+    }
+
+    /** Public-API reading fallback; system_brightness_float is an Android system setting. */
+    private static float savedNormalBrightness(Context ctx) {
+        if (ctx == null) return -1f;
         try {
-            Method m = dozeController.getClass().getDeclaredMethod("getScreenBrightnessFloat");
-            m.setAccessible(true);
-            Object value = m.invoke(dozeController);
-            if (value instanceof Number) return ((Number) value).floatValue();
+            float v = Settings.System.getFloat(
+                    ctx.getContentResolver(), "screen_brightness_float", -1f);
+            if (validNormal(v)) return v;
         } catch (Throwable ignored) { }
         try {
-            DisplayManager dm = null;
-            try { dm = (DisplayManager) XposedHelpers.getObjectField(dozeController, "mDisplayManager"); }
-            catch (Throwable ignored) { }
-            if (dm == null && ctx != null) dm = (DisplayManager) ctx.getSystemService(Context.DISPLAY_SERVICE);
+            int v = Settings.System.getInt(
+                    ctx.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, -1);
+            if (v > 0 && v <= 255) return v / 255f;
+        } catch (Throwable ignored) { }
+        return -1f;
+    }
+
+    /**
+     * Read the current normal brightness before entering Doze. DisplayManager.getBrightness
+     * is a hidden framework method: reflection prevents javac from needing that API.
+     */
+    private static float readLiveBrightness(Context ctx) {
+        if (ctx == null) return -1f;
+        try {
+            DisplayManager dm = (DisplayManager) ctx.getSystemService(Context.DISPLAY_SERVICE);
             if (dm == null) return -1f;
             Method get = dm.getClass().getMethod("getBrightness", int.class);
             Object value = get.invoke(dm, Display.DEFAULT_DISPLAY);
-            return value instanceof Number ? ((Number) value).floatValue() : -1f;
+            float f = value instanceof Number ? ((Number) value).floatValue() : -1f;
+            return validNormal(f) ? f : -1f;
         } catch (Throwable ignored) { return -1f; }
     }
 
+    private static void captureNormalBrightness(Context ctx) {
+        float live = readLiveBrightness(ctx);
+        if (!validNormal(live)) live = savedNormalBrightness(ctx);
+        if (validNormal(live)) {
+            sLastNormalBrightness = live;
+            XposedBridge.log(TAG + "AOD captured pre-doze normal brightness=" + live);
+        } else {
+            XposedBridge.log(TAG + "AOD cannot capture normal brightness; using fallback");
+        }
+    }
+
+    private static float targetAodBrightness(Context ctx) {
+        if (readInt(ctx, AOD_ENABLED, 0) != 1) return -1f;
+        int percent = Math.max(1, Math.min(100, readInt(ctx, AOD_RATIO, 10)));
+        float normal = sLastNormalBrightness;
+        // Don't call DisplayManager.getBrightness while dozing: it can return the AOD value.
+        if (!validNormal(normal)) normal = savedNormalBrightness(ctx);
+        if (!validNormal(normal)) return -1f;
+        return constrain(normal * percent / 100f, MIN_WORKING_DOZE, 1f);
+    }
+
     private static void hookDozeBrightness(ClassLoader loader) {
+        // Cache actual brightness whenever SystemUI reads it while the display is ON.
+        // Never cache Doze values, or the AOD ratio could feed back on itself.
         try {
-            Class<?> cls = XposedHelpers.findClass("com.android.systemui.doze.DozeScreenBrightness", loader);
-            XC_MethodHook hook = new XC_MethodHook() {
+            int cachedHooks = XposedBridge.hookAllMethods(DisplayManager.class,
+                    "getBrightness", new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam param) {
                     try {
-                        Object old = param.getResult();
-                        Context ctx = fieldContext(param.thisObject);
-                        if (readInt(ctx, AOD_ENABLED, 0) != 1) return;
-                        int pct = Math.max(1, Math.min(100, readInt(ctx, AOD_RATIO, 10)));
-                        float ratio = pct / 100f;
-                        float normal = normalDisplayBrightness(param.thisObject, ctx);
-                        if (!Float.isFinite(normal) || normal <= 0f || normal > 1.0f) return;
-                        // Mirrors AOSP's own source of current manual/auto brightness.
-                        float target = constrain(normal * ratio, 0.005f, 1.0f);
-                        if (old instanceof Float && ((Float)old) >= 0f) {
-                            param.setResult(target);
-                        } else if (old instanceof Integer && ((Integer)old) > 0) {
-                            param.setResult(Math.max(1, Math.min(255, Math.round(target * 255f))));
+                        if (param.args == null || param.args.length < 1
+                                || !(param.args[0] instanceof Integer)
+                                || ((Integer) param.args[0]) != Display.DEFAULT_DISPLAY
+                                || !(param.getResult() instanceof Float)) return;
+                        float v = ((Float) param.getResult()).floatValue();
+                        if (!validNormal(v)) return;
+                        Display display = ((DisplayManager) param.thisObject)
+                                .getDisplay(Display.DEFAULT_DISPLAY);
+                        if (display != null && display.getState() == Display.STATE_ON) {
+                            sLastNormalBrightness = v;
                         }
-                    } catch (Throwable t) { XposedBridge.log(TAG + "AOD hook: " + t); }
+                    } catch (Throwable ignored) { }
+                }
+            }).size();
+            XposedBridge.log(TAG + "AOD normal brightness cache hooks=" + cachedHooks);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "AOD normal brightness cache unavailable: " + t);
+        }
+
+        // Step 1: Make default Doze brightness nonzero BEFORE SystemUI sends its first request.
+        // On this phone, a 0.01 framework Doze resource works, while 0.0 yields black AOD.
+        try {
+            Class<?> cls = XposedHelpers.findClass("com.android.systemui.doze.DozeScreenBrightness", loader);
+            int count = XposedBridge.hookAllMethods(cls, "transitionTo", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (param.args == null || param.args.length < 2) return;
+                        if (!"INITIALIZED".equals(String.valueOf(param.args[1]))) return;
+                        Context ctx = contextOf(param.thisObject);
+                        if (readInt(ctx, AOD_ENABLED, 0) != 1) return;
+                        // Prefer a last screen-ON sample, if SystemUI observed one.
+                        if (!validNormal(sLastNormalBrightness)) captureNormalBrightness(ctx);
+                        try {
+                            Field f = param.thisObject.getClass().getDeclaredField(
+                                    "mDefaultDozeBrightnessFloat");
+                            f.setAccessible(true);
+                            float old = f.getFloat(param.thisObject);
+                            if (!Float.isFinite(old) || old < MIN_WORKING_DOZE) {
+                                f.setFloat(param.thisObject, MIN_WORKING_DOZE);
+                                XposedBridge.log(TAG + "AOD default Doze float raised from "
+                                        + old + " to " + MIN_WORKING_DOZE);
+                            }
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + "AOD float default field unavailable: " + t);
+                        }
+                        try {
+                            Field f = param.thisObject.getClass().getDeclaredField(
+                                    "mDefaultDozeBrightness");
+                            f.setAccessible(true);
+                            int old = f.getInt(param.thisObject);
+                            if (old <= 0) f.setInt(param.thisObject, 2);
+                        } catch (Throwable ignored) { }
+                    } catch (Throwable t) { XposedBridge.log(TAG + "AOD Doze initialization: " + t); }
+                }
+            }).size();
+            XposedBridge.log(TAG + "AOD DozeScreenBrightness.transitionTo hooks=" + count);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "AOD DozeScreenBrightness hook unavailable: " + t);
+        }
+
+        // Step 2: Hook the actual output interface, not only intermediate clamp methods.
+        // Handles both modern float and legacy int Doze brightness paths in SystemUI.
+        try {
+            Class<?> service = XposedHelpers.findClass("com.android.systemui.doze.DozeService", loader);
+            XC_MethodHook adjustFloat = new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (param.args == null || param.args.length < 1
+                                || !(param.args[0] instanceof Float)) return;
+                        float target = targetAodBrightness(contextOf(param.thisObject));
+                        if (target < 0f) return;
+                        float old = ((Float) param.args[0]).floatValue();
+                        param.args[0] = target;
+                        if (++sAodLogCount <= 16) XposedBridge.log(TAG
+                                + "AOD applied float " + old + " => " + target);
+                    } catch (Throwable t) { XposedBridge.log(TAG + "AOD float output: " + t); }
                 }
             };
-            // Both the sensor path and the default brightness path are covered.
-            int hooked = 0;
-            for (String method : new String[]{"clampToUserSettingFloat",
-                    "clampToUserSettingOrAutoBrightnessFloat",
-                    "clampToUserSetting", "clampToUserSettingOrAutoBrightness"}) {
-                try { if (!XposedBridge.hookAllMethods(cls, method, hook).isEmpty()) hooked++; }
-                catch (Throwable ignored) { }
-            }
-            XposedBridge.log(TAG + "Doze hooks installed: " + hooked + "/4 paths");
+            XC_MethodHook adjustInt = new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (param.args == null || param.args.length < 1
+                                || !(param.args[0] instanceof Integer)) return;
+                        float target = targetAodBrightness(contextOf(param.thisObject));
+                        if (target < 0f) return;
+                        int old = ((Integer) param.args[0]).intValue();
+                        int mapped = Math.max(1, Math.min(255, Math.round(target * 255f)));
+                        param.args[0] = mapped;
+                        if (++sAodLogCount <= 16) XposedBridge.log(TAG
+                                + "AOD applied int " + old + " => " + mapped);
+                    } catch (Throwable t) { XposedBridge.log(TAG + "AOD int output: " + t); }
+                }
+            };
+            int f = XposedBridge.hookAllMethods(service,
+                    "setDozeScreenBrightnessFloat", adjustFloat).size();
+            int i = XposedBridge.hookAllMethods(service,
+                    "setDozeScreenBrightness", adjustInt).size();
+            XposedBridge.log(TAG + "AOD DozeService output hooks float=" + f + " int=" + i);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "AOD hooks unavailable on this ROM: " + t);
+            XposedBridge.log(TAG + "AOD DozeService hooks unavailable: " + t);
         }
     }
 }
