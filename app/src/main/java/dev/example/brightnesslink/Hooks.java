@@ -94,6 +94,7 @@ public final class Hooks implements IXposedHookLoadPackage {
     // Keep the last NORMAL screen brightness, not the Doze brightness. The latter may be 0.
     private static volatile float sLastNormalBrightness = -1f;
     private static int sAodLogCount = 0;
+    private static int sAodSkipLogCount = 0;
     private static final float MIN_WORKING_DOZE = 0.01f; // confirmed with the user's old RRO
 
     private static Context contextOf(Object object) {
@@ -215,9 +216,29 @@ public final class Hooks implements IXposedHookLoadPackage {
                             Field f = param.thisObject.getClass().getDeclaredField(
                                     "mDefaultDozeBrightness");
                             f.setAccessible(true);
-                            int old = f.getInt(param.thisObject);
-                            if (old <= 0) f.setInt(param.thisObject, 2);
-                        } catch (Throwable ignored) { }
+                            // Some PixelOS builds use a float field with this *same* name.
+                            // getInt() on a float field throws and used to be silently ignored.
+                            Class<?> type = f.getType();
+                            if (type == float.class) {
+                                float old = f.getFloat(param.thisObject);
+                                if (!Float.isFinite(old) || old < MIN_WORKING_DOZE) {
+                                    f.setFloat(param.thisObject, MIN_WORKING_DOZE);
+                                    XposedBridge.log(TAG + "AOD default float field changed "
+                                            + old + " => " + MIN_WORKING_DOZE);
+                                }
+                            } else if (type == int.class) {
+                                int old = f.getInt(param.thisObject);
+                                if (old <= 0) {
+                                    f.setInt(param.thisObject, 3);
+                                    XposedBridge.log(TAG + "AOD default int field changed "
+                                            + old + " => 3");
+                                }
+                            } else {
+                                XposedBridge.log(TAG + "AOD default field unexpected type=" + type);
+                            }
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + "AOD default field patch failed: " + t);
+                        }
                     } catch (Throwable t) { XposedBridge.log(TAG + "AOD Doze initialization: " + t); }
                 }
             }).size();
@@ -266,6 +287,46 @@ public final class Hooks implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "AOD DozeService output hooks float=" + f + " int=" + i);
         } catch (Throwable t) {
             XposedBridge.log(TAG + "AOD DozeService hooks unavailable: " + t);
+        }
+
+        // PixelOS may inherit the float method from DreamService rather than override
+        // it in DozeService. hookAllMethods(DozeService, ...) sees declared methods only.
+        // The dump shows a FLOAT Doze brightness request (0.0), so also hook the base
+        // implementation, restricted to *DozeService instances* (not other dreams).
+        try {
+            final Class<?> dozeClass = XposedHelpers.findClass(
+                    "com.android.systemui.doze.DozeService", loader);
+            final Class<?> dreamClass = XposedHelpers.findClass(
+                    "android.service.dreams.DreamService", loader);
+            int count = XposedBridge.hookAllMethods(dreamClass,
+                    "setDozeScreenBrightnessFloat", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!dozeClass.isInstance(param.thisObject)) return;
+                    try {
+                        if (param.args == null || param.args.length != 1
+                                || !(param.args[0] instanceof Float)) return;
+                        Context ctx = contextOf(param.thisObject);
+                        float target = targetAodBrightness(ctx);
+                        if (target < 0f) {
+                            if (++sAodSkipLogCount <= 12) XposedBridge.log(TAG
+                                    + "AOD base float skipped: enabled="
+                                    + readInt(ctx, AOD_ENABLED, 0)
+                                    + " normalCache=" + sLastNormalBrightness
+                                    + " savedNormal=" + savedNormalBrightness(ctx));
+                            return;
+                        }
+                        float old = ((Float) param.args[0]).floatValue();
+                        param.args[0] = target;
+                        if (++sAodLogCount <= 24) XposedBridge.log(TAG
+                                + "AOD applied base float " + old + " => " + target);
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + "AOD base float error: " + t);
+                    }
+                }
+            }).size();
+            XposedBridge.log(TAG + "AOD DreamService inherited float hooks=" + count);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "AOD DreamService float hook unavailable: " + t);
         }
     }
 }
